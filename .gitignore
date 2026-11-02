@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.DS_Store
+
+# Korg's factory presets and editor files: kept locally for the tests, not shared
+*.syx
+*.r3l
+*.r3p
+r3l-samples/

@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R3 Librarian</title>
+<style>
+  :root {
+    --bg: #15171a; --panel: #1f2226; --text: #e6e6e6; --muted: #9aa0a6;
+    --accent: #f5a623; --ok: #5fd07a; --bad: #ff6b6b; --line: #33373c;
+  }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 -apple-system, system-ui, sans-serif; }
+  main { max-width: 900px; margin: 0 auto; padding: 24px 16px 60px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.sub { color: var(--muted); margin: 0 0 24px; }
+  section { background: var(--panel); border: 1px solid var(--line);
+            border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  h2 { font-size: 15px; margin: 0 0 10px; color: var(--accent); }
+  button, .fileBtn { background: var(--accent); color: #111; border: 0; border-radius: 6px;
+           padding: 8px 14px; font: 600 14px system-ui; cursor: pointer; margin: 4px 6px 4px 0;
+           display: inline-block; }
+  button.small { padding: 3px 8px; font-size: 12px; margin: 0; }
+  button:disabled { opacity: .4; cursor: default; }
+  select { background: #111; color: var(--text); border: 1px solid var(--line);
+           border-radius: 6px; padding: 6px 8px; font: inherit; max-width: 100%; }
+  label { display: block; margin: 8px 0 4px; color: var(--muted); font-size: 13px; }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; }
+  .row > div { flex: 1 1 240px; }
+  .ok { color: var(--ok); font-weight: 600; } .bad { color: var(--bad); font-weight: 600; }
+  .hint { color: var(--muted); font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; }
+  td.name { font-family: ui-monospace, monospace; }
+  #log { font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap;
+         word-break: break-all; max-height: 200px; overflow-y: auto; background: #0e0f11;
+         border-radius: 6px; padding: 10px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>R3 Librarian</h1>
+  <p class="sub">Version 0.1: get patches off the R3 and see what's on it.</p>
+
+  <section>
+    <h2>Connect</h2>
+    <button id="connectBtn">Connect to MIDI</button>
+    <span id="status">Not connected</span>
+    <div class="row">
+      <div><label for="inSel">Listen on (MIDI in)</label><select id="inSel" disabled></select></div>
+      <div><label for="outSel">Send to (MIDI out)</label><select id="outSel" disabled></select></div>
+      <div><label for="chanSel">R3 MIDI channel</label><select id="chanSel"></select></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Get patches</h2>
+    <button id="requestBtn" disabled>Ask R3 for current patch</button>
+    <label class="fileBtn">Open .syx file<input id="fileIn" type="file" accept=".syx" multiple hidden></label>
+    <p class="hint">For the whole bank: on the R3 hold SHIFT, press [6], turn PAGE to AllProg, press [6].
+      It takes about 3 minutes. Leave this page open and don't touch the R3 until the list fills up.</p>
+  </section>
+
+  <section>
+    <h2>Patches <span id="count" class="hint"></span></h2>
+    <button id="saveBankBtn" disabled>Save bank as one .syx</button>
+    <button id="clearListBtn" disabled>Clear list</button>
+    <p class="hint">The list is kept in this browser, so it's still here next time.
+      Browser storage can get wiped, so save the bank as a .syx file for a real backup.</p>
+    <p class="hint"><b>Send</b> loads a patch into what the R3 is playing right now. Nothing on the R3
+      is overwritten. To keep it, press WRITE on the R3 and pick a slot.
+      The R3 needs SystemEx turned on in its MIDIFilt page to receive patches.</p>
+    <div id="empty" class="hint">No patches yet.</div>
+    <table id="table" hidden>
+      <thead><tr><th>Slot</th><th>Name</th><th>From</th><th></th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Log</h2>
+    <div id="log">Nothing yet.</div>
+  </section>
+</main>
+
+<script src="r3.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+let midi = null;
+let patches = [];   // everything we've received or opened, newest batch first
+
+const toHex = (bytes) => Array.from(bytes, b => b.toString(16).toUpperCase().padStart(2, '0')).join(' ');
+
+function log(line) {
+  const el = $('log');
+  if (el.textContent === 'Nothing yet.') el.textContent = '';
+  el.textContent += `[${new Date().toLocaleTimeString()}] ${line}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+// Save bytes to the Downloads folder
+function download(bytes, filename) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// Redraw the patch table
+function render() {
+  $('rows').innerHTML = '';
+  patches.forEach((p, i) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${p.slot ?? '-'}</td><td class="name"></td><td class="hint"></td>
+      <td><button class="small" data-send="${i}">Send</button>
+          <button class="small" data-i="${i}">Save .syx</button></td>`;
+    tr.children[1].textContent = p.name || '(no name)';
+    tr.children[2].textContent = p.from;
+    $('rows').appendChild(tr);
+  });
+  $('table').hidden = patches.length === 0;
+  $('empty').hidden = patches.length > 0;
+  $('count').textContent = patches.length ? `(${patches.length})` : '';
+  $('saveBankBtn').disabled = !patches.some(p => p.slot);
+  $('clearListBtn').disabled = patches.length === 0;
+  saveList();
+}
+
+// --- Keeping the list between visits ---
+// We only store each patch's original SysEx message (as text, since browser
+// storage holds text) and where it came from. Everything else is re-read from it.
+const STORE_KEY = 'r3-librarian-patches';
+const bytesToText = (bytes) => btoa(String.fromCharCode(...bytes));
+const textToBytes = (text) => Uint8Array.from(atob(text), c => c.charCodeAt(0));
+
+function saveList() {
+  try {
+    const saved = patches.map(p => ({ from: p.from, msg: bytesToText(p.message) }));
+    localStorage.setItem(STORE_KEY, JSON.stringify(saved));
+  } catch (err) {
+    log(`Couldn't save the list in this browser: ${err.message}`);
+  }
+}
+
+function loadList() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORE_KEY) || '[]');
+    patches = saved.map(({ from, msg }) => {
+      const message = textToBytes(msg);
+      const r = R3.parse(message);
+      return { slot: r.slot, name: r.name, data: r.data, from, message };
+    });
+    if (patches.length) log(`Loaded ${patches.length} patches from last time.`);
+  } catch (err) {
+    patches = [];
+    log(`Couldn't load the saved list: ${err.message}`);
+  }
+  render();
+}
+
+$('clearListBtn').onclick = () => {
+  if (!confirm(`Remove all ${patches.length} patches from this list? Files you've saved aren't affected.`)) return;
+  patches = [];
+  render();
+  log('List cleared.');
+};
+
+// Each patch keeps the exact message it arrived in, so saving gives a known-good file
+$('rows').onclick = (e) => {
+  if (e.target.dataset.send !== undefined) return sendPatch(patches[e.target.dataset.send]);
+  const i = e.target.dataset.i;
+  if (i === undefined) return;
+  const p = patches[i];
+  const slot = p.slot ? String(p.slot).padStart(3, '0') + '-' : '';
+  download(p.message, `r3-${slot}${p.name.replace(/\W+/g, '_')}.syx`);
+};
+
+// Glue every bank patch together in slot order: the same file the R3 would send
+$('saveBankBtn').onclick = () => {
+  const bank = patches.filter(p => p.slot).sort((a, b) => a.slot - b.slot);
+  const total = bank.reduce((n, p) => n + p.message.length, 0);
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const p of bank) { out.set(p.message, at); at += p.message.length; }
+  download(out, `r3-bank-${new Date().toISOString().slice(0, 10)}.syx`);
+  log(`Saved bank file with ${bank.length} patches.`);
+};
+
+// Fill the channel picker with 1-16
+for (let c = 1; c <= 16; c++) $('chanSel').add(new Option(c, c));
+const channel = () => Number($('chanSel').value);
+
+function midiOut() {
+  const out = midi && midi.outputs.get($('outSel').value);
+  if (!out) log('Connect to MIDI and pick a MIDI out first.');
+  return out;
+}
+
+// Send a patch to the R3's current program (its edit buffer), not to a slot
+function sendPatch(p) {
+  const out = midiOut();
+  if (!out) return;
+  out.send(R3.toCurrentProgram(p.message, channel()));
+  log(`Sent "${p.name}" to the R3. Play a note to hear it. Press WRITE on the R3 if you want to keep it.`);
+}
+
+// Holds back table redraws while a bank streams in (128 messages in ~3 minutes)
+let redrawTimer = null;
+
+// One complete SysEx message from the R3 or a file
+function handleSysex(msg, from) {
+  const result = R3.parse(msg);
+  if (result.kind === 'program') {
+    const patch = { slot: result.slot, name: result.name, data: result.data, from, message: msg };
+    if (patch.slot) {
+      // A bank slot replaces whatever we already had in that slot
+      patches = patches.filter(p => p.slot !== patch.slot);
+      patches.push(patch);
+      patches.sort((a, b) => (a.slot ?? 0) - (b.slot ?? 0));
+      if (patch.slot === 1 || patch.slot === 128 || patch.slot % 16 === 0) {
+        log(`${from}: bank patch ${patch.slot} of 128, "${patch.name}"`);
+      }
+    } else {
+      patches.unshift(patch);
+      log(`${from}: current patch "${patch.name}"`);
+    }
+    clearTimeout(redrawTimer);
+    redrawTimer = setTimeout(render, 50);
+  } else if (result.kind === 'loaded') {
+    log('R3 says: data received OK.');
+  } else if (result.kind === 'loadError') {
+    log('R3 says: data load error. Check PROTECT and the MIDI channel on the R3.');
+  } else if (result.kind === 'unknown') {
+    // Probably global data, which the librarian doesn't handle yet
+    log(`${from}: R3 data I can't read yet, function ${result.func.toString(16).toUpperCase()}, ${result.size} bytes.`);
+  } else {
+    log(`${from}: SysEx that isn't from an R3, ${msg.length} bytes: ${toHex(msg.slice(0, 12))} ...`);
+  }
+}
+
+function onMessage(e) {
+  const d = e.data;
+  if (d[0] === 0xF8 || d[0] === 0xFE) return;   // skip clock and keep-alive pings
+  if (d[0] === 0xF0) handleSysex(d, 'R3');
+}
+
+function refreshPorts() {
+  const fill = (sel, ports) => {
+    const keep = sel.value;
+    sel.innerHTML = '';
+    for (const p of ports.values()) sel.add(new Option(p.name, p.id));
+    if ([...sel.options].some(o => o.value === keep)) sel.value = keep;
+  };
+  fill($('inSel'), midi.inputs);
+  fill($('outSel'), midi.outputs);
+  listenOn($('inSel').value);
+}
+
+function listenOn(id) {
+  for (const input of midi.inputs.values()) input.onmidimessage = input.id === id ? onMessage : null;
+}
+
+$('connectBtn').onclick = async () => {
+  if (!navigator.requestMIDIAccess) {
+    $('status').innerHTML = '<span class="bad">This browser has no Web MIDI. Use Chrome.</span>';
+    return;
+  }
+  try {
+    midi = await navigator.requestMIDIAccess({ sysex: true });
+  } catch (err) {
+    $('status').innerHTML = `<span class="bad">Blocked: ${err.message}</span>`;
+    return;
+  }
+  $('status').innerHTML = '<span class="ok">Connected</span>';
+  for (const id of ['inSel', 'outSel', 'requestBtn']) $(id).disabled = false;
+  midi.onstatechange = refreshPorts;
+  refreshPorts();
+};
+
+$('inSel').onchange = (e) => listenOn(e.target.value);
+
+$('requestBtn').onclick = () => {
+  const out = midiOut();
+  if (!out) return;
+  out.send(R3.requestCurrent(channel()));
+  log('Asked the R3 for its current patch. If nothing arrives, this request format is wrong; use SHIFT + [6] on the R3 instead.');
+};
+
+// Open .syx files from disk. A file can hold several SysEx messages back to back.
+$('fileIn').onchange = async (e) => {
+  for (const file of e.target.files) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    let start = bytes.indexOf(0xF0);
+    while (start !== -1) {
+      const end = bytes.indexOf(0xF7, start);
+      if (end === -1) break;
+      handleSysex(bytes.slice(start, end + 1), file.name);
+      start = bytes.indexOf(0xF0, end);
+    }
+  }
+  e.target.value = '';
+};
+
+loadList();
+</script>
+</body>
+</html>
